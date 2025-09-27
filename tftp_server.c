@@ -12,10 +12,8 @@
 #include <sys/stat.h>
 #include <errno.h>
 
-// SUPPORT 'octet' mode
-// DO NOT SUPPORT 'netascii' or 'mail' mode
 
-#define TFTP_BASE_DIR "./tftp_files/"
+#define TFTP_BASE_DIR "./tftp_dir/"
 
 // OPCODES
 typedef enum {
@@ -41,7 +39,7 @@ typedef enum {
 // TFTP Message Structures
 typedef struct {
     uint16_t opcode;    // RRQ or WRQ
-    char filename[512]; // Null-terminated filename
+    char filename[512]; // Null-terminated filename (not sure about this. might have to ask if the file is null terminated)
     char mode[10];      // "octet" mode
 } tftp_rrq_wrq_t;
 
@@ -64,12 +62,18 @@ typedef struct {
 
 // SIGCHLD handler to clean up zombie processes
 void sigchld_handler(int sig) {
-    (void)sig; // Suppress unused parameter warning
-    while (waitpid(-1, NULL, WNOHANG) > 0);
+    (void)sig; // suppress unused parameter warning
+    pid_t pid;
+    while ( (pid = waitpid(-1, NULL, WNOHANG)) > 0 ) {
+        // Child process cleaned up successfully
+    }
+    if ( pid < 0 && errno != ECHILD ) {
+        perror("waitpid in sigchld_handler");
+    }
 }
 
 // Handle ACK response from client
-int handle_ack(int sockfd, uint16_t expected_block) {
+int recv_ack(int sockfd, uint16_t expected_block) {
     tftp_ack_t ack_packet;
     struct sockaddr_in ack_addr;
     socklen_t ack_len = sizeof(ack_addr);
@@ -79,12 +83,12 @@ int handle_ack(int sockfd, uint16_t expected_block) {
     ssize_t ack_received = recvfrom(sockfd, &ack_packet, sizeof(ack_packet), 0,
                                    (struct sockaddr*)&ack_addr, &ack_len);
     
-    if (ack_received < 0) {
+    if ( ack_received < 0 ) {
         perror("recvfrom ACK");
         return -1;
     }
     
-    if (ack_received != sizeof(tftp_ack_t)) {
+    if ( ack_received != sizeof(tftp_ack_t) ) {
         printf("Error: Invalid ACK packet size (%zd bytes, expected %zu)\n", 
                ack_received, sizeof(tftp_ack_t));
         return -1;
@@ -96,12 +100,12 @@ int handle_ack(int sockfd, uint16_t expected_block) {
     
     printf("Received ACK: opcode=%d, block=%d\n", ack_opcode, ack_block);
     
-    if (ack_opcode != ACK) {
+    if ( ack_opcode != ACK ) {
         printf("Error: Expected ACK opcode, got %d\n", ack_opcode);
         return -1;
     }
     
-    if (ack_block != expected_block) {
+    if ( ack_block != expected_block ) {
         printf("Error: Expected block %d, got %d\n", expected_block, ack_block);
         return -1;
     }
@@ -110,7 +114,29 @@ int handle_ack(int sockfd, uint16_t expected_block) {
     return 0;
 }
 
+// Send ACK packet to client
+int send_ack(int sockfd, struct sockaddr_in* cliaddr, uint16_t block_num) {
+    tftp_ack_t ack_packet;
+    ack_packet.opcode = htons(ACK);
+    ack_packet.block = htons(block_num);
+    
+    ssize_t sent = sendto(sockfd, &ack_packet, sizeof(ack_packet), 0, 
+                         (struct sockaddr*)cliaddr, sizeof(*cliaddr));
+    
+    if ( sent < 0 ) {
+        perror("sendto ACK");
+        return -1;
+    }
+    if ( sent != sizeof(ack_packet) ) {
+        printf("Warning: Only sent %zd of %zu ACK bytes\n", sent, sizeof(ack_packet));
+    }
+    
+    return 0;
+}
+
 void handle_read(char* buffer, int sockfd, struct sockaddr_in* cliaddr) {
+    FILE* file = NULL;
+    
     // Parse RRQ request: [opcode][filename][\0][mode][\0]
     char* filename = buffer + 2;  // Skip opcode
     char* mode = filename + strlen(filename) + 1;  // Skip filename and null
@@ -124,7 +150,7 @@ void handle_read(char* buffer, int sockfd, struct sockaddr_in* cliaddr) {
     // printf("\n");
     
     // Validate mode
-    if (strcmp(mode, "octet") != 0) {
+    if ( strcmp(mode, "octet") != 0 ) {
         printf("Error: Only octet mode supported, got '%s'\n", mode);
         tftp_error_t error;
         error.opcode = htons(ERROR);
@@ -135,14 +161,14 @@ void handle_read(char* buffer, int sockfd, struct sockaddr_in* cliaddr) {
         return;
     }
     
-    // Create safe file path
+    // Create file path
     char file_path[512];
     snprintf(file_path, sizeof(file_path), "%s%s", TFTP_BASE_DIR, filename);
     printf("Opening file: %s\n", file_path);
     
     // Open file for reading
-    FILE* file = fopen(file_path, "rb");
-    if (file == NULL) {
+    file = fopen(file_path, "rb");
+    if ( file == NULL ) {
         printf("Error: File not found\n");
         tftp_error_t error;
         error.opcode = htons(ERROR);
@@ -163,6 +189,10 @@ void handle_read(char* buffer, int sockfd, struct sockaddr_in* cliaddr) {
     do {
         // Read data from file
         bytes_read = fread(data, 1, 512, file);
+        if ( ferror(file) ) {
+            perror("fread");
+            break;
+        }
         
         // Create DATA packet
         tftp_data_t data_packet;
@@ -172,33 +202,138 @@ void handle_read(char* buffer, int sockfd, struct sockaddr_in* cliaddr) {
         
         // Send DATA packet
         size_t packet_size = 4 + bytes_read;  // opcode(2) + block(2) + data
-        ssize_t sent = sendto(sockfd, &data_packet, packet_size, 0,
+        sendto(sockfd, &data_packet, packet_size, 0,
                              (struct sockaddr*)cliaddr, sizeof(*cliaddr));
         
-        if (sent < 0) {
-            perror("sendto DATA");
-            break;
-        }
         
         printf("Sent DATA block %d (%zu bytes)\n", block_num, bytes_read);
         
-        // Wait for ACK using dedicated function
-        if (handle_ack(sockfd, block_num) != 0) {
+        // Wait for ACK 
+        if ( recv_ack(sockfd, block_num) != 0 ) {
             printf("Error: ACK handling failed for block %d\n", block_num);
             break;
         }
         
         block_num++;
         
-    } while (bytes_read == 512);  // Continue if we read a full 512-byte block
+    } while ( bytes_read == 512 );  // Continue if we read a full 512-byte block
     
-    fclose(file);
+    // Close file before returning
+    if ( file ) { fclose(file); }
     printf("File transfer completed\n");
+    return;
 }
 
 void handle_write(char* buffer, int sockfd, struct sockaddr_in* cliaddr) {
-    // TODO: Implement WRQ handling
-    (void)buffer; (void)sockfd; (void)cliaddr; // Suppress unused parameter warnings
+    FILE* file = NULL;
+    
+    // Parse WRQ request: [opcode][filename][\0][mode][\0]
+    char* filename = buffer + 2;  // Skip opcode
+    char* mode = filename + strlen(filename) + 1;  // Skip filename and null
+    
+    // Validate mode
+    if ( strcmp(mode, "octet") != 0 ) {
+        printf("Error: Only octet mode supported, got '%s'\n", mode);
+        tftp_error_t error;
+        error.opcode = htons(ERROR);
+        error.error_code = htons(ERR_ILLEGAL_OPERATION);
+        strcpy(error.error_msg, "Only octet mode supported");
+        sendto(sockfd, &error, sizeof(error), 0, 
+               (struct sockaddr*)cliaddr, sizeof(*cliaddr));
+        return;
+    }
+
+    // Create file path
+    char file_path[512];
+    snprintf(file_path, sizeof(file_path), "%s%s", TFTP_BASE_DIR, filename);
+    printf("Creating file: %s\n", file_path);
+
+    // Create file
+    file = fopen(file_path, "wb");
+    if ( file == NULL ) {
+        printf("Error: Failed to create file\n");
+        tftp_error_t error;
+        error.opcode = htons(ERROR);
+        error.error_code = htons(ERR_ACCESS_VIOLATION);
+        strcpy(error.error_msg, "Failed to create file");
+        sendto(sockfd, &error, sizeof(error), 0, 
+               (struct sockaddr*)cliaddr, sizeof(*cliaddr));
+        return;
+    }
+
+    // Send ACK for block 0 to acknowledge WRQ
+    printf("Sending ACK for block 0 to acknowledge WRQ\n");
+    if ( send_ack(sockfd, cliaddr, 0) < 0 ) {
+        perror("sendto ACK 0");
+        fclose(file);
+        return;
+    }
+
+    // Now wait for DATA packets starting with block 1
+    uint16_t expected_block = 1;
+    size_t bytes_received;
+
+    printf("Waiting for DATA packets starting with block 1...\n");
+
+    do {
+        // Receive DATA packet
+        tftp_data_t data_packet;
+        struct sockaddr_in from_addr;
+        socklen_t from_len = sizeof(from_addr);
+        
+        ssize_t received = recvfrom(sockfd, &data_packet, sizeof(data_packet), 0,
+                                   (struct sockaddr*)&from_addr, &from_len);
+        
+        if ( received < 0 ) {
+            perror("recvfrom DATA");
+            break;
+        }
+        
+        // Parse DATA packet
+        uint16_t data_opcode = ntohs(data_packet.opcode);
+        uint16_t data_block = ntohs(data_packet.block);
+        bytes_received = received - 4; // Subtract opcode and block size
+        
+        printf("Received DATA: opcode=%d, block=%d, bytes=%zu\n", 
+               data_opcode, data_block, bytes_received);
+        
+        if ( data_opcode != DATA ) {
+            printf("Error: Expected DATA opcode, got %d\n", data_opcode);
+            break;
+        }
+        
+        if ( data_block != expected_block ) {
+            printf("Error: Expected block %d, got %d\n", expected_block, data_block);
+            break;
+        }
+        
+        // Write data to file
+        size_t written = fwrite(data_packet.data, 1, bytes_received, file);
+        if ( written != bytes_received ) {
+            perror("fwrite");
+            break;
+        }
+        if ( ferror(file) ) {
+            perror("file write error");
+            break;
+        }
+        printf("Wrote %zu bytes to file\n", bytes_received);
+        
+        // Send ACK for this block
+        printf("Sending ACK for block %d\n", data_block);
+        if ( send_ack(sockfd, cliaddr, data_block) < 0 ) {
+            perror("sendto ACK");
+            break;
+        }
+        
+        expected_block++;
+        
+    } while ( bytes_received == 512 ); // Continue if we received a full 512-byte block
+    
+    // Close file before returning
+    if ( file ) { fclose(file); }
+    
+    printf("File transfer completed\n");
     return;
 }
 
@@ -226,7 +361,7 @@ int main(int argc, char *argv[]) {
 
     if( argc != 3 ) {
         fprintf(stderr, "usage:\n\t%s [start of port range] [end of port range]\n", argv[0]);
-        return EXIT_FAILURE;
+        exit(EXIT_FAILURE);
     }
 
     int					sockfd;
@@ -238,28 +373,31 @@ int main(int argc, char *argv[]) {
     // Validate port range
     if ( start_port < 1 || end_port < 1 ) {
         fprintf(stderr, "Port numbers must be between 1 and 65535\n");
-        return EXIT_FAILURE;
+        exit(EXIT_FAILURE);
     }
     
     if ( start_port > end_port ) {
         fprintf(stderr, "Start port must be less than or equal to end port\n");
-        return EXIT_FAILURE;
+        exit(EXIT_FAILURE);
     }
     
     // Set up SIGCHLD handler to clean up zombie processes
-    signal(SIGCHLD, sigchld_handler);
+    if ( signal(SIGCHLD, sigchld_handler) == SIG_ERR ) {
+        perror("signal");
+        exit(EXIT_FAILURE);
+    }
     
     // Create base directory if it doesn't exist
     if (mkdir(TFTP_BASE_DIR, 0755) != 0 && errno != EEXIST) {
         perror("mkdir");
-        return EXIT_FAILURE;
+        exit(EXIT_FAILURE);
     }
 
 	// Create UDP socket
 	sockfd = socket(AF_INET, SOCK_DGRAM, 0);
 	if ( sockfd < 0 ) {
 		perror("socket");
-		return EXIT_FAILURE;
+		exit(EXIT_FAILURE);
 	}
 
 	// Set up server address (listen on any interface, start_port)
@@ -272,12 +410,12 @@ int main(int argc, char *argv[]) {
 	if ( bind(sockfd, (struct sockaddr *) &servaddr, sizeof(servaddr)) < 0 ) {
 		perror("bind");
 		close(sockfd);
-		return EXIT_FAILURE;
+		exit(EXIT_FAILURE);
 	}
 	
 	printf("TFTP server listening on port %d\n", start_port);
 
-    uint16_t tid_port = start_port + 1;
+    uint16_t tid_port = start_port;
 
     // Infinite server loop
     for( ; ; ) {
@@ -289,15 +427,27 @@ int main(int argc, char *argv[]) {
         n = recvfrom(sockfd, buffer, sizeof(buffer), 0, 
                      (struct sockaddr *)&cliaddr, &len);
         if ( n < 0 ) {
-            perror("recvfrom");
-            continue;
+            if ( errno == EINTR ) {
+                // Interrupted by SIGCHLD handler - continue listening
+                continue;
+            } else {
+                perror("recvfrom");
+                continue;
+            }
         }
         
-        // Check if we have available ports before forking
         uint16_t next_tid_port = tid_port + 1;
+        
+        // Check if we have available ports before forking
         if ( next_tid_port > end_port ) {
             fprintf(stderr, "Error: All ports in range [%d-%d] have been used\n", 
                     start_port + 1, end_port);
+            tftp_error_t error;
+            error.opcode = htons(ERROR);
+            error.error_code = htons(ERR_DISK_FULL);
+            strcpy(error.error_msg, "All ports in range have been used");
+            sendto(sockfd, &error, sizeof(error), 0, 
+                (struct sockaddr*)&cliaddr, sizeof(cliaddr));
             continue;
         }
         
@@ -306,6 +456,10 @@ int main(int argc, char *argv[]) {
         if ( pid == 0 ) {
             // Child process - handle the request
             close(sockfd); // Close parent's socket
+            
+            // Use the next available TID port
+            uint16_t child_tid_port = next_tid_port;
+            printf("Forked child process with TID: %d\n", child_tid_port);
             
             // Create new socket for this connection
             int tid_sockfd = socket(AF_INET, SOCK_DGRAM, 0);
@@ -319,7 +473,7 @@ int main(int argc, char *argv[]) {
             bzero(&tid_addr, sizeof(tid_addr));
             tid_addr.sin_family = AF_INET;
             tid_addr.sin_addr.s_addr = htonl(INADDR_ANY);
-            tid_addr.sin_port = htons(tid_port);
+            tid_addr.sin_port = htons(child_tid_port);
             
             if ( bind(tid_sockfd, (struct sockaddr *)&tid_addr, sizeof(tid_addr)) < 0 ) {
                 perror("bind in child");
@@ -340,7 +494,7 @@ int main(int argc, char *argv[]) {
         }
     }
 
-
     close(sockfd);
-    return EXIT_SUCCESS;
+    printf("Server shutting down\n");
+    exit(EXIT_SUCCESS);
 }
